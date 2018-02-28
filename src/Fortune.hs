@@ -11,10 +11,11 @@ import BreakpointTree
 import Control.Monad (liftM, join)
 
 import Data.Maybe (maybeToList, catMaybes)
-import Data.List (sortOn)
+import Data.List (sortOn, minimumBy)
 
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector as V
+import Data.Vector (Vector)
 
 import qualified Data.Map.Strict as Map
 import           Data.Map.Strict (Map)
@@ -25,6 +26,7 @@ import           Data.HashPSQ (HashPSQ)
 
 type Index = Int
 type Coord = Double
+type BBox = (Point', Point')
 
 --data Point = P !Index !Coord !Coord deriving (Show)
 
@@ -32,6 +34,7 @@ type Point'= (Double, Double)
 
 data Edge  = EmptyEdge | IEdge !Point' | Edge !Point' !Point'
 data Edge' = Edge' !Index !Index !Point' !Point' deriving (Show)
+
 
 type NewPointEvent = Point
 data CircleEvent   = CircleEvent !Point !Point !Point !Coord !Point'
@@ -250,22 +253,24 @@ processEvent state
     voronoi takes a Vector of pairs of Double(s) and returns a Vector of
     Edge(s) representing the corresponding voronoi diagram.
 -}
-voronoi :: [Point'] -> [Edge']
-voronoi points =
+voronoi :: BBox -> [Point'] -> [Edge']
+voronoi bbox points =
   let
     go :: State -> [Edge']
     go state = if ((null.newPointEvents.events) state) &&
       ((null.circleEvents.events) state) then
-      mapToList . edges $ state
+      mapToList ps bbox . edges $ state
     else
       go (processEvent state)
-  in
-    go . mkState $ points
 
-mkState :: [Point'] -> State
+    (state0, ps) = mkState points
+  in go state0
+
+mkState :: [Point'] -> (State, Vector Point')
 mkState points = let
-  ps = sortOn snd points
-  newPEvents' = (V.imap (\i (x, y) -> P i x y)) . V.fromList $ ps
+  ps = V.fromList $ sortOn snd points
+
+  newPEvents' = (V.imap (\i (x, y) -> P i x y)) $ ps
   newPEvents = V.tail . V.tail $ newPEvents'
   p0@(P i _ _) = (newPEvents' V.! 0)
   p1@(P j _ d) = (newPEvents' V.! 1)
@@ -274,14 +279,65 @@ mkState points = let
   firstPair = Node Nil b1 $ Node Nil b2 Nil
   firstEdge = Map.singleton (sortPair i j) EmptyEdge
   in
-    State (Events newPEvents PSQ.empty) firstPair firstEdge d
+    (State (Events newPEvents PSQ.empty) firstPair firstEdge d, ps)
 
-mapToList map = let
-  list' = Map.toList map
-  predicate (_, e) = case e of
-    Edge _ _ -> True
-    _ -> False
-  list = filter predicate list'
-  edge' ((i, j), Edge l r) = Edge' i j l r
-  in
-    fmap edge' list
+-- | Given a ray with a gradient and origin, returns its two intersection points
+-- with the given bounding box.
+intersectBBox :: Double -> Point' -> BBox -> [Point']
+intersectBBox gradient (ox, oy) ((lx, by), (rx, ty)) =
+  let vx = 1
+      vy = gradient
+      ray t = (ox + t * vx, oy + t * vy)
+
+      -- t values of intersection with right, left, top, bottom respectively
+      tr = (rx - ox) / vx
+      tl = (lx - ox) / vx
+      tt = (ty - oy) / vy
+      tb = (by - oy) / vy
+
+      inX x = lx <= x && x <= rx
+      inY y = by <= y && y <= ty
+
+      tryX t y =
+        let x = fst (ray t)
+        in if inX x then [(x, y)] else []
+      tryY x t =
+        let y = snd (ray t)
+        in if inY y then [(x, y)] else []
+
+  in tryY lx tl ++
+     tryY rx tr ++
+     tryX tb by ++
+     tryX tt ty
+
+dist :: (Floating a) => (a, a) -> (a, a) -> a
+dist (xa, ya) (xb, yb) =
+  let dx = xa - xb
+      dy = ya - yb
+  in sqrt (dx*dx + dy*dy)
+
+edgeBoxEndpoints :: Vector Point' -> BBox -> (Int, Int) -> [Point']
+edgeBoxEndpoints ps bbox (i, j) =
+  let (xi, yi) = ps V.! i
+      (xj, yj) = ps V.! j
+
+      rayOrigin = ((xi + xj) / 2, (yi + yj) / 2)
+      betweenGrad = (yj - yi) / (xj - xi)
+      rayGrad = - 1 / betweenGrad
+  in intersectBBox rayGrad rayOrigin bbox
+
+tryCompleteEdge :: Vector Point' -> BBox -> ((Int, Int), Edge) -> Maybe Edge'
+tryCompleteEdge _ _ ((i, j), Edge x y) = Just $ Edge' i j x y
+tryCompleteEdge ps bbox ((i, j), EmptyEdge) =
+  let [boxp1, boxp2] = edgeBoxEndpoints ps bbox (i, j)
+  in Just $ Edge' i j boxp1 boxp2
+tryCompleteEdge ps bbox ((i, j), IEdge edgep) =
+  let [boxp1, boxp2] = edgeBoxEndpoints ps bbox (i, j)
+
+      boxp = if dist boxp1 edgep < dist boxp2 edgep
+             then boxp1
+             else boxp2
+  in Just $ Edge' i j edgep boxp
+
+mapToList :: Vector Point' -> BBox -> Map (Int, Int) Edge -> [Edge']
+mapToList ps bbox = catMaybes . map (tryCompleteEdge ps bbox) . Map.toList
